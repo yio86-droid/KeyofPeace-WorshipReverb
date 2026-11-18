@@ -1,214 +1,363 @@
-#pragma once
+#include "PluginProcessor.h"
+#include "PluginEditor.h"
 
-#include <juce_audio_processors/juce_audio_processors.h>
-
-#include <array>
-#include <atomic>
-#include <cmath>
-#include <vector>
-
-#if (MSVC)
-#include "ipps.h"
-#endif
-
-//==============================================================================
-namespace ParamIDs
+namespace
 {
-    inline constexpr const char* decay    = "decay";
-    inline constexpr const char* preDelay = "predelay";
-    inline constexpr const char* lowCut   = "lowcut";
-    inline constexpr const char* highCut  = "highcut";
-    inline constexpr const char* mix      = "mix";
+    // Longitudes de las 8 líneas (ms): valores "irracionales" y crecientes
+    // para espacios amplios y sin coincidencias de modos.
+    constexpr float kLineMs[8] = { 37.3f, 43.1f, 51.7f, 59.3f, 67.1f, 74.9f, 83.3f, 91.7f };
+
+    // Modulación sutil: profundidad (ms) y velocidad (Hz) distintas por línea
+    constexpr float kModMs[8] = { 0.45f, 0.60f, 0.50f, 0.75f, 0.55f, 0.85f, 0.65f, 0.90f };
+    constexpr float kLfoHz[8] = { 0.11f, 0.17f, 0.23f, 0.29f, 0.37f, 0.43f, 0.51f, 0.59f };
+
+    constexpr float kMaxLineMs = 91.7f;
+    constexpr float kMaxModMs = 0.9f;
+
+    // Patrones Walsh (ortogonales) para decorrelar L y R a la salida
+    constexpr float kSignL[8] = { +1.0f, +1.0f, -1.0f, -1.0f, +1.0f, +1.0f, -1.0f, -1.0f };
+    constexpr float kSignR[8] = { +1.0f, -1.0f, -1.0f, +1.0f, +1.0f, -1.0f, -1.0f, +1.0f };
+
+    constexpr float kInputGain = 0.5f;
+    constexpr float kOutputGain = 0.35f;
 }
 
 //==============================================================================
-/**
-    KeyofPeace Worship Reverb
-
-    Algoritmo: pre-delay -> difusión de entrada (2 allpass por canal)
-               -> FDN de 8 líneas con matriz Hadamard (ortonormal, 24 sumas/restas)
-               -> salida estéreo decorrelada con patrones Walsh.
-
-    - Cada línea tiene delay modulado (LFO parabólico lento, <3 cents de desviación)
-      para romper resonancias metálicas.
-    - Cada línea tiene damping (paso-bajo 1 polo) y low-cut (paso-alto 1 polo),
-      así la cola se vuelve más suave y oscura con el tiempo.
-    - Ganancia de realimentación por línea calculada a partir de RT60.
-*/
-class PluginProcessor : public juce::AudioProcessor
+PluginProcessor::PluginProcessor()
+    : AudioProcessor (BusesProperties()
+                          .withInput ("Input", juce::AudioChannelSet::stereo(), true)
+                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
-public:
-    PluginProcessor();
-    ~PluginProcessor() override;
+    decayParam    = apvts.getRawParameterValue (ParamIDs::decay);
+    preDelayParam = apvts.getRawParameterValue (ParamIDs::preDelay);
+    lowCutParam   = apvts.getRawParameterValue (ParamIDs::lowCut);
+    highCutParam  = apvts.getRawParameterValue (ParamIDs::highCut);
+    mixParam      = apvts.getRawParameterValue (ParamIDs::mix);
+}
 
-    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
-    void releaseResources() override;
+PluginProcessor::~PluginProcessor() = default;
 
-    bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::createParameterLayout()
+{
+    using APF = juce::AudioParameterFloat;
+    using Attr = juce::AudioParameterFloatAttributes;
 
-    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
-    using juce::AudioProcessor::processBlock;
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
-    juce::AudioProcessorEditor* createEditor() override;
-    bool hasEditor() const override;
+    params.push_back (std::make_unique<APF> (
+        juce::ParameterID { ParamIDs::decay, 1 }, "Decay Time",
+        juce::NormalisableRange<float> (1.5f, 6.0f, 0.01f), 3.5f,
+        Attr().withLabel ("s")));
 
-    const juce::String getName() const override;
+    params.push_back (std::make_unique<APF> (
+        juce::ParameterID { ParamIDs::preDelay, 1 }, "Pre-Delay",
+        juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 40.0f,
+        Attr().withLabel ("ms")));
 
-    bool acceptsMidi() const override;
-    bool producesMidi() const override;
-    bool isMidiEffect() const override;
-    double getTailLengthSeconds() const override;
-
-    int getNumPrograms() override;
-    int getCurrentProgram() override;
-    void setCurrentProgram (int index) override;
-    const juce::String getProgramName (int index) override;
-    void changeProgramName (int index, const juce::String& newName) override;
-
-    void getStateInformation (juce::MemoryBlock& destData) override;
-    void setStateInformation (const void* data, int sizeInBytes) override;
-
-    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-    juce::AudioProcessorValueTreeState apvts;
-
-private:
-    //==========================================================================
-    static constexpr int kNumLines = 8;
-    static constexpr int kSubBlock = 32;   // los coeficientes se actualizan cada 32 muestras
-
-    // Delay circular (potencia de 2) con interpolación lineal.
-    // tap(d): valor escrito d muestras antes de la PRÓXIMA escritura (d >= 1).
-    struct DelayLine
     {
-        std::vector<float> buf;
-        int mask = 0;
-        int writePos = 0;
-
-        void prepare (int maxDelaySamples)
-        {
-            int size = 1;
-            while (size < maxDelaySamples + 4)
-                size <<= 1;
-            buf.assign ((size_t) size, 0.0f);
-            mask = size - 1;
-            writePos = 0;
-        }
-
-        void reset()
-        {
-            std::fill (buf.begin(), buf.end(), 0.0f);
-            writePos = 0;
-        }
-
-        inline void push (float x) noexcept
-        {
-            buf[(size_t) writePos] = x;
-            writePos = (writePos + 1) & mask;
-        }
-
-        inline float tap (float delay) const noexcept
-        {
-            const int di = (int) delay;
-            const float frac = delay - (float) di;
-            const int i0 = (writePos - di) & mask;
-            const int i1 = (i0 - 1) & mask;
-            const float a = buf[(size_t) i0];
-            const float b = buf[(size_t) i1];
-            return a + frac * (b - a);
-        }
-
-        inline float tapInt (int delay) const noexcept
-        {
-            return buf[(size_t) ((writePos - delay) & mask)];
-        }
-    };
-
-    // All-pass de Schroeder con longitud fija
-    struct Allpass
+        juce::NormalisableRange<float> r (80.0f, 400.0f, 1.0f);
+        r.setSkewForCentre (180.0f);
+        params.push_back (std::make_unique<APF> (
+            juce::ParameterID { ParamIDs::lowCut, 1 }, "Low-Cut",
+            r, 180.0f, Attr().withLabel ("Hz")));
+    }
     {
-        DelayLine line;
-        int length = 1;
-        float g = 0.6f;
-
-        void prepare (int len, float gain)
-        {
-            length = juce::jmax (1, len);
-            g = gain;
-            line.prepare (length + 2);
-        }
-
-        void reset() { line.reset(); }
-
-        inline float process (float x) noexcept
-        {
-            const float z = line.tapInt (length);
-            const float w = x - g * z;
-            line.push (w);
-            return g * w + z;
-        }
-    };
-
-    static inline void hadamard8 (float* v) noexcept
-    {
-        for (int i = 0; i < 8; i += 2)
-        {
-            const float a = v[i], b = v[i + 1];
-            v[i] = a + b;
-            v[i + 1] = a - b;
-        }
-        for (int i = 0; i < 8; i += 4)
-            for (int j = 0; j < 2; ++j)
-            {
-                const float a = v[i + j], b = v[i + j + 2];
-                v[i + j] = a + b;
-                v[i + j + 2] = a - b;
-            }
-        for (int j = 0; j < 4; ++j)
-        {
-            const float a = v[j], b = v[j + 4];
-            v[j] = a + b;
-            v[j + 4] = a - b;
-        }
-        constexpr float scale = 0.35355339059f; // 1/sqrt(8)
-        for (int i = 0; i < 8; ++i)
-            v[i] *= scale;
+        juce::NormalisableRange<float> r (2000.0f, 12000.0f, 10.0f);
+        r.setSkewForCentre (4900.0f);
+        params.push_back (std::make_unique<APF> (
+            juce::ParameterID { ParamIDs::highCut, 1 }, "High-Cut / Damping",
+            r, 6500.0f, Attr().withLabel ("Hz")));
     }
 
-    void updateCoefficients (int chunk) noexcept;
-    inline void processFrame (float inL, float inR, float& wetL, float& wetR) noexcept;
+    params.push_back (std::make_unique<APF> (
+        juce::ParameterID { ParamIDs::mix, 1 }, "Dry/Wet",
+        juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 28.0f,
+        Attr().withLabel ("%")));
 
-    //==========================================================================
-    double sr = 44100.0;
+    return { params.begin(), params.end() };
+}
 
-    // Parámetros (punteros atómicos del APVTS)
-    std::atomic<float>* decayParam    = nullptr;
-    std::atomic<float>* preDelayParam = nullptr;
-    std::atomic<float>* lowCutParam   = nullptr;
-    std::atomic<float>* highCutParam  = nullptr;
-    std::atomic<float>* mixParam      = nullptr;
+//==============================================================================
+const juce::String PluginProcessor::getName() const
+{
+    return JucePlugin_Name;
+}
 
-    juce::SmoothedValue<float> decaySm, preDelaySm, lowCutSm, highCutSm, mixSm;
+bool PluginProcessor::acceptsMidi() const
+{
+    return false;
+}
 
-    // Etapas
-    DelayLine preDelay[2];
-    Allpass diffuser[2][2];
-    float inLow[2] { 0.0f, 0.0f };   // low-cut de entrada
+bool PluginProcessor::producesMidi() const
+{
+    return false;
+}
 
-    DelayLine lines[kNumLines];
-    std::array<float, kNumLines> baseDelay {};   // muestras
-    std::array<float, kNumLines> delaySec {};
-    std::array<float, kNumLines> modDepth {};    // muestras
-    std::array<float, kNumLines> lfoPhase {};
-    std::array<float, kNumLines> lfoInc {};
-    std::array<float, kNumLines> lpState {};
-    std::array<float, kNumLines> hpState {};
-    std::array<float, kNumLines> fbGain {};
+bool PluginProcessor::isMidiEffect() const
+{
+    return false;
+}
 
-    // Coeficientes actuales
-    float lpA = 0.5f;    // damping (paso-bajo)
-    float hpB = 0.01f;   // low-cut (seguidor de graves)
-    float preSamples = 0.0f;
-    float dryGain = 1.0f, wetGain = 0.0f;
+double PluginProcessor::getTailLengthSeconds() const
+{
+    return 8.0;
+}
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
-};
+int PluginProcessor::getNumPrograms()
+{
+    return 1;
+}
+
+int PluginProcessor::getCurrentProgram()
+{
+    return 0;
+}
+
+void PluginProcessor::setCurrentProgram (int index)
+{
+    juce::ignoreUnused (index);
+}
+
+const juce::String PluginProcessor::getProgramName (int index)
+{
+    juce::ignoreUnused (index);
+    return {};
+}
+
+void PluginProcessor::changeProgramName (int index, const juce::String& newName)
+{
+    juce::ignoreUnused (index, newName);
+}
+
+//==============================================================================
+bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+        return false;
+
+    const auto in = layouts.getMainInputChannelSet();
+    return in == juce::AudioChannelSet::stereo() || in == juce::AudioChannelSet::mono();
+}
+
+//==============================================================================
+void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    juce::ignoreUnused (samplesPerBlock);
+    sr = sampleRate;
+
+    // FDN
+    const int maxLine = (int) std::ceil (sr * (kMaxLineMs + kMaxModMs) * 0.001) + 8;
+    for (int i = 0; i < kNumLines; ++i)
+    {
+        lines[i].prepare (maxLine);
+        baseDelay[(size_t) i] = kLineMs[i] * 0.001f * (float) sr;
+        delaySec[(size_t) i]  = kLineMs[i] * 0.001f;
+        modDepth[(size_t) i]  = kModMs[i] * 0.001f * (float) sr;
+        lfoInc[(size_t) i]    = 2.0f * kLfoHz[i] / (float) sr;   // el LFO recorre [-1,1) => periodo 2
+        lfoPhase[(size_t) i]  = -1.0f + 2.0f * (float) i / (float) kNumLines;
+        lpState[(size_t) i]   = 0.0f;
+        hpState[(size_t) i]   = 0.0f;
+        fbGain[(size_t) i]    = 0.0f;
+    }
+
+    // Pre-delay (máx. 100 ms)
+    const int maxPre = (int) std::ceil (sr * 0.1) + 8;
+    for (auto& d : preDelay)
+        d.prepare (maxPre);
+
+    // Difusión de entrada (distintas longitudes en L y R => más ancho)
+    const double apMs[2][2] = { { 4.3, 7.1 }, { 4.9, 8.3 } };
+    for (int c = 0; c < 2; ++c)
+        for (int k = 0; k < 2; ++k)
+            diffuser[c][k].prepare ((int) std::lround (apMs[c][k] * 0.001 * sr), 0.6f);
+
+    inLow[0] = inLow[1] = 0.0f;
+
+    // Suavizado de parámetros
+    const double rampSec = 0.08;
+    decaySm.reset (sr, rampSec);
+    decaySm.setCurrentAndTargetValue (decayParam->load());
+    preDelaySm.reset (sr, rampSec);
+    preDelaySm.setCurrentAndTargetValue (preDelayParam->load());
+    lowCutSm.reset (sr, rampSec);
+    lowCutSm.setCurrentAndTargetValue (lowCutParam->load());
+    highCutSm.reset (sr, rampSec);
+    highCutSm.setCurrentAndTargetValue (highCutParam->load());
+    mixSm.reset (sr, rampSec);
+    mixSm.setCurrentAndTargetValue (mixParam->load());
+
+    updateCoefficients (0);
+}
+
+void PluginProcessor::releaseResources()
+{
+}
+
+//==============================================================================
+void PluginProcessor::updateCoefficients (int chunk) noexcept
+{
+    const float decay  = chunk > 0 ? decaySm.skip (chunk)    : decaySm.getCurrentValue();
+    const float preMs  = chunk > 0 ? preDelaySm.skip (chunk) : preDelaySm.getCurrentValue();
+    const float lowHz  = chunk > 0 ? lowCutSm.skip (chunk)   : lowCutSm.getCurrentValue();
+    float highHz       = chunk > 0 ? highCutSm.skip (chunk)  : highCutSm.getCurrentValue();
+    const float mixPct = chunk > 0 ? mixSm.skip (chunk)      : mixSm.getCurrentValue();
+
+    constexpr float twoPi = juce::MathConstants<float>::twoPi;
+    const float fs = (float) sr;
+
+    highHz = juce::jmin (highHz, 0.45f * fs);
+
+    lpA = 1.0f - std::exp (-twoPi * highHz / fs);
+    hpB = 1.0f - std::exp (-twoPi * lowHz / fs);
+
+    // RT60 -> ganancia por pasada: g = 10^(-3 * delay / RT60)
+    const float invRT = -3.0f / juce::jmax (0.1f, decay);
+    for (int i = 0; i < kNumLines; ++i)
+        fbGain[(size_t) i] = std::pow (10.0f, invRT * delaySec[(size_t) i]);
+
+    preSamples = preMs * 0.001f * fs;
+
+    // Mezcla equal-power
+    const float mixAmt = juce::jlimit (0.0f, 1.0f, mixPct * 0.01f);
+    dryGain = std::cos (mixAmt * juce::MathConstants<float>::halfPi);
+    wetGain = std::sin (mixAmt * juce::MathConstants<float>::halfPi);
+}
+
+//==============================================================================
+inline void PluginProcessor::processFrame (float inL, float inR,
+                                           float& wetL, float& wetR) noexcept
+{
+    // --- Low-cut de entrada (evita retumbo en las primeras reflexiones)
+    inLow[0] += hpB * (inL - inLow[0]);
+    inLow[1] += hpB * (inR - inLow[1]);
+    const float xl = inL - inLow[0];
+    const float xr = inR - inLow[1];
+
+    // --- Pre-delay (push primero, luego tap con +1 => delay 0 válido)
+    preDelay[0].push (xl);
+    preDelay[1].push (xr);
+    float dl = preDelay[0].tap (preSamples + 1.0f);
+    float dr = preDelay[1].tap (preSamples + 1.0f);
+
+    // --- Difusión de entrada
+    dl = diffuser[0][1].process (diffuser[0][0].process (dl));
+    dr = diffuser[1][1].process (diffuser[1][0].process (dr));
+
+    // --- FDN: lectura con modulación, damping y low-cut por línea
+    float y[kNumLines];
+    for (int i = 0; i < kNumLines; ++i)
+    {
+        float t = lfoPhase[(size_t) i];
+        const float mod = 4.0f * t * (1.0f - std::abs (t));   // seno parabólico barato
+        t += lfoInc[(size_t) i];
+        if (t >= 1.0f)
+            t -= 2.0f;
+        lfoPhase[(size_t) i] = t;
+
+        const float d = baseDelay[(size_t) i] + modDepth[(size_t) i] * mod;
+        float s = lines[i].tap (d);
+
+        float& lp = lpState[(size_t) i];
+        lp += lpA * (s - lp);   // damping (paso-bajo)
+        s = lp;
+
+        float& hp = hpState[(size_t) i];
+        hp += hpB * (s - hp);   // seguidor de graves
+        s -= hp;                // low-cut (paso-alto)
+
+        y[i] = s * fbGain[(size_t) i];
+    }
+
+    // --- Salida estéreo decorrelada
+    float oL = 0.0f, oR = 0.0f;
+    for (int i = 0; i < kNumLines; ++i)
+    {
+        oL += kSignL[i] * y[i];
+        oR += kSignR[i] * y[i];
+    }
+    wetL = oL * kOutputGain;
+    wetR = oR * kOutputGain;
+
+    // --- Mezcla ortonormal + inyección de entrada (L en líneas pares, R en impares)
+    hadamard8 (y);
+    for (int i = 0; i < kNumLines; ++i)
+    {
+        const float in = ((i & 1) ? dr : dl) * kInputGain;
+        lines[i].push (y[i] + in);
+    }
+}
+
+//==============================================================================
+void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    const int numSamples = buffer.getNumSamples();
+    const int numChannels = buffer.getNumChannels();
+    if (numSamples == 0 || numChannels == 0)
+        return;
+
+    decaySm.setTargetValue (decayParam->load());
+    preDelaySm.setTargetValue (preDelayParam->load());
+    lowCutSm.setTargetValue (lowCutParam->load());
+    highCutSm.setTargetValue (highCutParam->load());
+    mixSm.setTargetValue (mixParam->load());
+
+    float* left = buffer.getWritePointer (0);
+    float* right = numChannels > 1 ? buffer.getWritePointer (1) : nullptr;
+    const bool monoIn = getTotalNumInputChannels() < 2;
+
+    int pos = 0;
+    while (pos < numSamples)
+    {
+        const int chunk = juce::jmin (kSubBlock, numSamples - pos);
+        updateCoefficients (chunk);
+
+        for (int n = 0; n < chunk; ++n)
+        {
+            const float dryL = left[pos + n];
+            const float dryR = (right != nullptr && ! monoIn) ? right[pos + n] : dryL;
+
+            float wl = 0.0f, wr = 0.0f;
+            processFrame (dryL, dryR, wl, wr);
+
+            left[pos + n] = dryL * dryGain + wl * wetGain;
+            if (right != nullptr)
+                right[pos + n] = dryR * dryGain + wr * wetGain;
+        }
+        pos += chunk;
+    }
+}
+
+//==============================================================================
+bool PluginProcessor::hasEditor() const
+{
+    return true;
+}
+
+juce::AudioProcessorEditor* PluginProcessor::createEditor()
+{
+    return new PluginEditor (*this);
+}
+
+//==============================================================================
+void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    if (auto xml = apvts.copyState().createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    if (auto xml = getXmlFromBinary (data, sizeInBytes))
+        if (xml->hasTagName (apvts.state.getType()))
+            apvts.replaceState (juce::ValueTree::fromXml (*xml));
+}
+
+//==============================================================================
+// This creates new instances of the plugin.
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new PluginProcessor();
+}
